@@ -29,7 +29,7 @@ providing interactive placement, simulation, and integration helpers grounded in
 ## Notes
 - Default drift/error values now follow the TDK InvenSense ICM-45686 specs (3.8 mdps/√Hz gyro noise, 70 µg/√Hz accel noise, small bias proxies), drawing on the datasheet and comparisons such as https://docs.slimevr.dev/diy/imu-comparison.html and https://invensense.tdk.com/products/motion-tracking/6-axis/icm-45686/.
 - Synthetic motion follows a 3D smooth random walk inspired by FANET mobility modeling ([Barrado et al., 2019](https://www.researchgate.net/publication/333199745_A_3D_Smooth_Random_Walk_Mobility_Model_for_FANETs)).
-- The simulator performs weighted strapdown integration using exported accelerometer/gyroscope weights (Equations 15–24 in [Kan et al. (2025)](https://arxiv.org/html/2506.00371v1)).
+- The simulator performs weighted strapdown integration using exported accelerometer/gyroscope weights (Equations 15–24 in [Kan et al. (2025)](https://arxiv.org/html/2506.00371v1)). Bias terms relax toward zero over time to mimic in-flight recalibration, and weights are periodically recomputed from the saved noise/position data.
 - Random-flight trajectories clamp altitude to the 0–15,000 m envelope (MQ-9/Reaper-like), while speed remains user-tunable up to 150 m/s.
 - Saved configurations land in `saved_configs/` by default.
 - Penn COSYVIO dataset links are provided for real data download alongside the synthetic generator.

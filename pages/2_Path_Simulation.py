@@ -117,6 +117,43 @@ def _simulate_path(duration_s: float, avg_speed: float, step: float = 0.01) -> T
     return t, pos, R_list, omega_true, specific_force_body
 
 
+def _recompute_weights(config: Dict, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Recompute weights from config noise/positions to mimic on-vehicle recalibration."""
+
+    accel_weights = np.array(config.get("weights", {}).get("accelerometer", []), dtype=float)
+    gyro_weights = np.array(config.get("weights", {}).get("gyroscope", []), dtype=float)
+
+    drift_models: List[Dict[str, float]] = config.get("drift_models", []) if config else []
+    noise_sigmas = np.array([model.get("noise_density", 0.003) for model in drift_models], dtype=float)
+    noise_sigmas = np.where(noise_sigmas <= 0, 1e-6, noise_sigmas)
+
+    if accel_weights.size != n or np.isclose(accel_weights.sum(), 0.0):
+        positions = np.array(config.get("positions", []), dtype=float)
+        if positions.shape[0] != n:
+            accel_weights = np.full(n, 1.0 / n)
+        else:
+            sigma_sq = np.square(noise_sigmas)
+            Sigma_inv = np.diag(1.0 / sigma_sq)
+            R = positions.T
+            R_bar = R @ Sigma_inv
+            R_bar_RT = R_bar @ R.T
+            r_bar = R_bar @ np.ones(n)
+            correction = R.T @ (np.linalg.pinv(R_bar_RT) @ r_bar)
+            w_hat = Sigma_inv @ (np.ones(n) - correction)
+            denom = np.sum(w_hat)
+            accel_weights = np.full(n, 1.0 / n) if np.isclose(denom, 0.0) else w_hat / denom
+    else:
+        accel_weights = accel_weights / accel_weights.sum()
+
+    if gyro_weights.size != n or np.isclose(gyro_weights.sum(), 0.0):
+        inv_sigma_sq = 1.0 / np.square(noise_sigmas)
+        gyro_weights = inv_sigma_sq / np.sum(inv_sigma_sq)
+    else:
+        gyro_weights = gyro_weights / gyro_weights.sum()
+
+    return accel_weights, gyro_weights
+
+
 def _strapdown_path(
     t: np.ndarray,
     pos_true: np.ndarray,
@@ -125,7 +162,7 @@ def _strapdown_path(
     specific_force_body: np.ndarray,
     config: Dict,
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """Perform strapdown integration using fused IMU biases/weights (Eq. 15)."""
+    """Perform strapdown integration using fused IMU biases/weights (Eq. 15) with bias relaxation."""
 
     if t.size < 2:
         return pos_true.copy(), rotations_true
@@ -136,16 +173,7 @@ def _strapdown_path(
     if n == 0:
         return pos_true.copy(), rotations_true
 
-    accel_weights = np.array(config.get("weights", {}).get("accelerometer", []), dtype=float)
-    gyro_weights = np.array(config.get("weights", {}).get("gyroscope", []), dtype=float)
-    if accel_weights.size != n or np.isclose(accel_weights.sum(), 0.0):
-        accel_weights = np.full(n, 1.0 / n)
-    else:
-        accel_weights = accel_weights / accel_weights.sum()
-    if gyro_weights.size != n or np.isclose(gyro_weights.sum(), 0.0):
-        gyro_weights = np.full(n, 1.0 / n)
-    else:
-        gyro_weights = gyro_weights / gyro_weights.sum()
+    accel_weights, gyro_weights = _recompute_weights(config, n)
 
     accel_biases = np.array([model.get("accel_bias_mps2", 0.0) for model in drift_models], dtype=float)
     gyro_biases = np.array([model.get("gyro_drift_dps", 0.0) for model in drift_models], dtype=float)
@@ -157,6 +185,10 @@ def _strapdown_path(
     fused_accel_sigma = float(np.sqrt(np.sum(np.square(accel_weights * accel_noises))))
     fused_gyro_sigma = float(np.sqrt(np.sum(np.square(gyro_weights * gyro_noises))))
 
+    # allow slow bias relaxation toward zero to mimic online recalibration
+    bias_relax_hz = float(config.get("bias_relax_hz", 0.05))
+    bias_relax_hz = max(bias_relax_hz, 1e-6)
+
     dt = np.diff(t)
     g = np.array([0.0, 0.0, -9.81])
 
@@ -165,18 +197,24 @@ def _strapdown_path(
     q_est = np.array([1.0, 0.0, 0.0, 0.0])
     R_est_list: List[np.ndarray] = [_quat_to_rotmat(q_est)]
 
+    fused_accel_bias_est = fused_accel_bias
+    fused_gyro_bias_est = fused_gyro_bias
+    accel_weights_est = accel_weights.copy()
+    gyro_weights_est = gyro_weights.copy()
+    recal_window = max(1, int(np.round(1.0 / bias_relax_hz)))
+
     rng = np.random.default_rng()
 
     for i in range(1, t.size):
         dt_i = dt[i - 1]
 
         # Measurements synthesized from truth + fused bias/noise
-        gyro_meas = omega_true[i] + np.deg2rad(fused_gyro_bias) + rng.normal(scale=np.deg2rad(fused_gyro_sigma), size=3)
-        accel_meas = specific_force_body[i] + fused_accel_bias + rng.normal(scale=fused_accel_sigma, size=3)
+        gyro_meas = omega_true[i] + np.deg2rad(fused_gyro_bias_est) + rng.normal(scale=np.deg2rad(fused_gyro_sigma), size=3)
+        accel_meas = specific_force_body[i] + fused_accel_bias_est + rng.normal(scale=fused_accel_sigma, size=3)
 
         # Bias-compensated estimates (Eq. 15)
-        omega_est = gyro_meas - np.deg2rad(fused_gyro_bias)
-        accel_body_est = accel_meas - fused_accel_bias
+        omega_est = gyro_meas - np.deg2rad(fused_gyro_bias_est)
+        accel_body_est = accel_meas - fused_accel_bias_est
 
         # Quaternion update using exponential map
         angle = np.linalg.norm(omega_est) * dt_i
@@ -192,6 +230,19 @@ def _strapdown_path(
         pos_est[i, 2] = np.clip(pos_est[i, 2], 0.0, 15000.0)
         if pos_est[i, 2] in {0.0, 15000.0}:
             vel_est[i, 2] = 0.0
+
+        # Self-correct fused bias toward slow-drift assumption and refresh weights periodically
+        decay = np.exp(-bias_relax_hz * dt_i)
+        fused_accel_bias_est *= decay
+        fused_gyro_bias_est *= decay
+        if i % recal_window == 0:
+            accel_weights_est, gyro_weights_est = _recompute_weights(config, n)
+            fused_accel_bias = float(np.dot(accel_weights_est, accel_biases))
+            fused_gyro_bias = float(np.dot(gyro_weights_est, gyro_biases))
+            fused_accel_sigma = float(np.sqrt(np.sum(np.square(accel_weights_est * accel_noises))))
+            fused_gyro_sigma = float(np.sqrt(np.sum(np.square(gyro_weights_est * gyro_noises))))
+            fused_accel_bias_est = fused_accel_bias
+            fused_gyro_bias_est = fused_gyro_bias
 
     return pos_est, R_est_list
 
