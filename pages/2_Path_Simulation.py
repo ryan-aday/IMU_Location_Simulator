@@ -20,7 +20,7 @@ def _load_config(uploaded_file) -> Dict:
     return json.load(uploaded_file)
 
 
-def _simulate_path(duration_s: float, spatial_span: float, avg_speed: float, step: float = 0.01):
+def _simulate_path(duration_s: float, avg_speed: float, step: float = 0.01):
     """Smooth 3D random walk using correlated turn rates (FANET-inspired smooth model).
 
     The smooth-turn mobility idea (see "A 3D Smooth Random Walk Mobility Model for FANETs")
@@ -55,55 +55,132 @@ def _simulate_path(duration_s: float, spatial_span: float, avg_speed: float, ste
     # Speed profile with mild noise, clipped to non-negative
     speed = np.clip(avg_speed + rng.normal(scale=0.05 * avg_speed, size=n), a_min=0.0, a_max=None)
 
-    # Position integration with spatial clamping to the chosen span
+    # Position integration from heading + speed
     pos = np.zeros((n, 3))
     for i in range(1, n):
         vel = heading[i] * speed[i]
         pos[i] = pos[i - 1] + vel * dt
-        # softly push back toward center if we exceed the span
-        radius = np.linalg.norm(pos[i])
-        if radius > spatial_span:
-            pos[i] -= 0.2 * (radius - spatial_span) * pos[i] / (radius + 1e-6)
 
-    return t, pos
+    return t, pos, heading
 
 
-def _apply_imu_bias(path: np.ndarray, config: Dict, step: float = 0.01):
-    """Apply weighted bias/noise derived from the saved IMU network configuration.
+def _rotation_matrix_from_heading(heading: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    """Build a body-to-world rotation from a heading vector, keeping axes orthonormal."""
 
-    The saved JSON carries per-IMU accelerometer/gyroscope weights and noise models. We
-    collapse the accelerometer terms into a fused bias and fused noise using the same
-    weighting that placed the VIMU frame (Eq. 18–25). Noise is injected as a small
-    acceleration error and integrated to velocity/position to reduce over-inflated drift
-    while still reflecting how additional IMUs (and optimal weights) shrink \(\sigma^2\).
-    """
+    eps = 1e-8
+    h = heading
+    if np.linalg.norm(h) < eps:
+        h = fallback
+    h = h / (np.linalg.norm(h) + eps)
 
-    if not config:
-        return path.copy()
+    world_up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(world_up, h)
+    if np.linalg.norm(right) < eps:
+        world_up = np.array([0.0, 1.0, 0.0])
+        right = np.cross(world_up, h)
+    right = right / (np.linalg.norm(right) + eps)
 
-    drift_models: List[Dict[str, float]] = config.get("drift_models", [])
+    body_z = np.cross(h, right)
+    body_z = body_z / (np.linalg.norm(body_z) + eps)
+
+    R_bw = np.stack([h, right, body_z], axis=1)  # columns are body axes in world frame
+    return R_bw
+
+
+def _angular_velocity(R_prev: np.ndarray, R_curr: np.ndarray, dt: float) -> np.ndarray:
+    """Approximate body angular velocity from successive rotation matrices."""
+
+    delta = R_prev.T @ R_curr
+    trace = np.trace(delta)
+    angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+    if angle < 1e-6:
+        return np.zeros(3)
+
+    skew = (delta - delta.T) / (2.0 * np.sin(angle) + 1e-9)
+    axis = np.array([skew[2, 1], skew[0, 2], skew[1, 0]])
+    return axis * angle / dt
+
+
+def _strapdown_path(t: np.ndarray, pos_true: np.ndarray, heading: np.ndarray, config: Dict) -> np.ndarray:
+    """Perform strapdown integration using fused IMU biases/weights (Eq. 15)."""
+
+    if t.size < 2:
+        return pos_true.copy()
+
+    drift_models: List[Dict[str, float]] = config.get("drift_models", []) if config else []
     n = len(drift_models)
-    if n == 0:
-        return path.copy()
 
-    # Pull accelerometer weights; if missing or mismatched, fall back to uniform weights.
+    if n == 0:
+        return pos_true.copy()
+
     accel_weights = np.array(config.get("weights", {}).get("accelerometer", []), dtype=float)
+    gyro_weights = np.array(config.get("weights", {}).get("gyroscope", []), dtype=float)
     if accel_weights.size != n or np.isclose(accel_weights.sum(), 0.0):
         accel_weights = np.full(n, 1.0 / n)
     else:
         accel_weights = accel_weights / accel_weights.sum()
+    if gyro_weights.size != n or np.isclose(gyro_weights.sum(), 0.0):
+        gyro_weights = np.full(n, 1.0 / n)
+    else:
+        gyro_weights = gyro_weights / gyro_weights.sum()
 
-    biases = np.array([model.get("accel_bias_mps2", 0.0) for model in drift_models], dtype=float)
-    noise_sigmas = np.array([model.get("noise_density", 0.003) for model in drift_models], dtype=float)
+    accel_biases = np.array([model.get("accel_bias_mps2", 0.0) for model in drift_models], dtype=float)
+    gyro_biases = np.array([model.get("gyro_drift_dps", 0.0) for model in drift_models], dtype=float)
+    accel_noises = np.array([model.get("noise_density", 0.003) for model in drift_models], dtype=float)
+    gyro_noises = accel_noises  # reuse density as proxy
 
-    fused_bias = float(np.dot(accel_weights, biases))
-    fused_sigma = float(np.sqrt(np.sum(np.square(accel_weights * noise_sigmas))))
+    fused_accel_bias = float(np.dot(accel_weights, accel_biases))
+    fused_gyro_bias = float(np.dot(gyro_weights, gyro_biases))
+    fused_accel_sigma = float(np.sqrt(np.sum(np.square(accel_weights * accel_noises))))
+    fused_gyro_sigma = float(np.sqrt(np.sum(np.square(gyro_weights * gyro_noises))))
 
-    # Treat fused bias/noise as acceleration disturbance and integrate to velocity/position.
-    accel_error = fused_bias + np.random.normal(scale=fused_sigma, size=path.shape)
-    vel_error = np.cumsum(accel_error * step, axis=0)
-    pos_error = np.cumsum(vel_error * step, axis=0)
-    return path + pos_error
+    dt = np.diff(t)
+    g = np.array([0.0, 0.0, -9.81])
+
+    # Build reference rotations
+    R_list = []
+    fallback = np.array([1.0, 0.0, 0.0])
+    for h in heading:
+        R_list.append(_rotation_matrix_from_heading(h, fallback))
+        fallback = h if np.linalg.norm(h) > 1e-8 else fallback
+
+    pos_est = np.zeros_like(pos_true)
+    vel_est = np.zeros_like(pos_true)
+    R_est = R_list[0].copy()
+
+    rng = np.random.default_rng()
+
+    # Compute true kinematics for measurement synthesis
+    vel_true = np.gradient(pos_true, t, axis=0)
+    accel_true = np.gradient(vel_true, t, axis=0)
+
+    for i in range(1, t.size):
+        dt_i = dt[i - 1]
+        R_true_prev = R_list[i - 1]
+        R_true_curr = R_list[i]
+        omega_true = _angular_velocity(R_true_prev, R_true_curr, dt_i)
+
+        # Measurements
+        gyro_meas = omega_true + np.deg2rad(fused_gyro_bias) + rng.normal(scale=np.deg2rad(fused_gyro_sigma), size=3)
+        accel_body_true = R_true_curr.T @ (accel_true[i] - g)
+        accel_meas = accel_body_true + fused_accel_bias + rng.normal(scale=fused_accel_sigma, size=3)
+
+        # Bias-compensated estimates (Eq. 15 simplified)
+        omega_est = gyro_meas - np.deg2rad(fused_gyro_bias)
+        accel_body_est = accel_meas - fused_accel_bias
+
+        # Orientation update (first-order integration)
+        angle = np.linalg.norm(omega_est) * dt_i
+        if angle > 0:
+            axis = omega_est / (np.linalg.norm(omega_est) + 1e-9)
+            K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+            R_est = R_est @ (np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K))
+
+        accel_world = R_est @ accel_body_est + g
+        vel_est[i] = vel_est[i - 1] + accel_world * dt_i
+        pos_est[i] = pos_est[i - 1] + vel_est[i] * dt_i
+
+    return pos_est
 
 
 def _plot_paths(t: np.ndarray, truth: np.ndarray, estimate: np.ndarray):
@@ -141,11 +218,6 @@ def main():
     duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=97200.0, value=60.0, step=1.0)
     avg_speed = st.sidebar.slider("Average speed (m/s)", min_value=0.1, max_value=150.0, value=2.0, step=0.1)
 
-    max_span = max(0.5, min(10000.0, 0.25 * avg_speed * duration))
-    spatial_span = st.sidebar.slider(
-        "Path spatial span (m)", min_value=0.5, max_value=float(max_span), value=min(3.0, float(max_span)), step=0.1
-    )
-
     if dataset_choice == "Penn COSYVIO (describe)":
         meta = _load_penn_metadata()
         st.info(
@@ -154,8 +226,8 @@ def main():
         )
 
     st.subheader("Generate trajectory")
-    t, ground_truth = _simulate_path(duration, spatial_span=spatial_span, avg_speed=avg_speed)
-    estimate = _apply_imu_bias(ground_truth, config)
+    t, ground_truth, heading = _simulate_path(duration, avg_speed=avg_speed)
+    estimate = _strapdown_path(t, ground_truth, heading, config)
     _plot_paths(t, ground_truth, estimate)
 
     position_error = np.linalg.norm(estimate - ground_truth, axis=1)
@@ -182,11 +254,9 @@ def main():
     st.table(summary)
 
     st.info(
-        "Why can errors still exceed the paper? The simulator now respects your saved accelerometer weights when"
-        " fusing biases/noise, but it still injects random-walk noise on position directly instead of performing"
-        " full strapdown integration with gyro/accel coupling and fused-bias tracking (Eq. 15). Lever-arm removal is"
-        " approximated through the weights, yet attitude error, gravity alignment, and filter dynamics from the paper"
-        " remain simplified, so results are conservative upper bounds."
+        "Errors may still exceed the paper if the simplified strapdown (first-order integration, coarse angular"
+        " rates) drifts or if the heading proxy deviates from your intended body frame. Leverage your exported"
+        " weights in a higher-fidelity strapdown to reduce drift further."
     )
 
     export = {
@@ -210,8 +280,8 @@ def main():
     )
 
     st.caption(
-        "Synthetic path uses a smooth random walk inspired by the FANET mobility model; drift follows your weights and"
-        " bias settings but still omits full strapdown/lever-arm dynamics from the paper."
+        "Synthetic path uses a smooth random walk inspired by the FANET mobility model; bias and noise follow your"
+        " saved weights through strapdown integration."
     )
 
 
