@@ -20,26 +20,57 @@ def _load_config(uploaded_file) -> Dict:
     return json.load(uploaded_file)
 
 
-def _simulate_path(duration_s: float, step: float = 0.01):
+def _simulate_path(duration_s: float, radius: float, avg_speed: float, step: float = 0.01):
+    """Generate a gentle Lissajous-like path with configurable spatial range and speed."""
     t = np.arange(0, duration_s, step)
-    radius = 2.0
-    z_amp = 0.5
+
+    # Approximate angular rate to match desired average speed around the XY loop
+    safe_radius = max(radius, 0.1)
+    omega_xy = max(avg_speed / safe_radius, 0.05)
+    omega_z = 0.5 * omega_xy
+    z_amp = 0.25 * safe_radius
+
     ground_truth = np.stack(
-        [radius * np.cos(0.5 * t), radius * np.sin(0.5 * t), z_amp * np.sin(0.25 * t)], axis=1
+        [safe_radius * np.cos(omega_xy * t), safe_radius * np.sin(omega_xy * t), z_amp * np.sin(omega_z * t)],
+        axis=1,
     )
     return t, ground_truth
 
 
 def _apply_imu_bias(path: np.ndarray, config: Dict, step: float = 0.01):
+    """Apply weighted bias/noise derived from the saved IMU network configuration.
+
+    The saved JSON carries per-IMU accelerometer/gyroscope weights and noise models. We
+    collapse the accelerometer terms into a fused bias and fused noise using the same
+    weighting that placed the VIMU frame (Eq. 18–25). This keeps the simulator aligned
+    with the configuration authoring page instead of averaging biases naively.
+    """
+
     if not config:
         return path.copy()
-    noise_scale = 0.01
-    drift_sum = 0.0
-    for model in config.get("drift_models", []):
-        drift_sum += model.get("accel_bias_mps2", 0.0)
-    drift_mean = drift_sum / max(1, len(config.get("drift_models", [])))
-    noisy = path + np.cumsum(np.random.normal(scale=noise_scale, size=path.shape) * step, axis=0)
-    noisy += drift_mean * step * np.arange(path.shape[0])[:, None]
+
+    drift_models: List[Dict[str, float]] = config.get("drift_models", [])
+    n = len(drift_models)
+    if n == 0:
+        return path.copy()
+
+    # Pull accelerometer weights; if missing or mismatched, fall back to uniform weights.
+    accel_weights = np.array(config.get("weights", {}).get("accelerometer", []), dtype=float)
+    if accel_weights.size != n or np.isclose(accel_weights.sum(), 0.0):
+        accel_weights = np.full(n, 1.0 / n)
+    else:
+        accel_weights = accel_weights / accel_weights.sum()
+
+    biases = np.array([model.get("accel_bias_mps2", 0.0) for model in drift_models], dtype=float)
+    noise_sigmas = np.array([model.get("noise_density", 0.003) for model in drift_models], dtype=float)
+
+    fused_bias = float(np.dot(accel_weights, biases))
+    fused_sigma = float(np.sqrt(np.sum(np.square(accel_weights * noise_sigmas))))
+
+    # Weighted noise and bias accumulation applied to position proxy.
+    noise = np.random.normal(scale=fused_sigma, size=path.shape)
+    noisy = path + np.cumsum(noise * step, axis=0)
+    noisy += fused_bias * step * np.arange(path.shape[0])[:, None]
     return noisy
 
 
@@ -76,6 +107,8 @@ def main():
 
     dataset_choice = st.sidebar.radio("Trajectory source", ["Random synthetic", "Penn COSYVIO (describe)"])
     duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=60.0, value=20.0, step=1.0)
+    radius = st.sidebar.slider("Path range / radius (m)", min_value=0.5, max_value=20.0, value=3.0, step=0.1)
+    avg_speed = st.sidebar.slider("Average speed (m/s)", min_value=0.1, max_value=12.0, value=2.0, step=0.1)
 
     if dataset_choice == "Penn COSYVIO (describe)":
         meta = _load_penn_metadata()
@@ -85,7 +118,7 @@ def main():
         )
 
     st.subheader("Generate trajectory")
-    t, ground_truth = _simulate_path(duration)
+    t, ground_truth = _simulate_path(duration, radius=radius, avg_speed=avg_speed)
     estimate = _apply_imu_bias(ground_truth, config)
     _plot_paths(t, ground_truth, estimate)
 
@@ -100,6 +133,14 @@ def main():
     )
     st.subheader("Error summary")
     st.table(summary)
+
+    st.info(
+        "Why can errors still exceed the paper? The simulator now respects your saved accelerometer weights when"
+        " fusing biases/noise, but it still injects random-walk noise on position directly instead of performing"
+        " full strapdown integration with gyro/accel coupling and fused-bias tracking (Eq. 15). Lever-arm removal is"
+        " approximated through the weights, yet attitude error, gravity alignment, and filter dynamics from the paper"
+        " remain simplified, so results are conservative upper bounds."
+    )
 
     export = {
         "time": t.tolist(),
@@ -117,7 +158,8 @@ def main():
     )
 
     st.caption(
-        "Synthetic path uses a gentle Lissajous curve; error accumulation is influenced by your drift settings."
+        "Synthetic path uses a gentle Lissajous curve; error accumulation is influenced by your drift settings,"
+        " the simplified random-walk bias model here, and the lack of attitude/lever-arm compensation used in the paper."
     )
 
 

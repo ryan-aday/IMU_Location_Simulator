@@ -8,29 +8,35 @@ st.caption(
 
 st.header("Sensor & Motion Model")
 st.markdown(
-    r"""The paper models each IMU \(i\) at lever arm position \(r_i\) in the vehicle frame. "
-    r"Body-frame specific force \(a_i\) and angular rate \(\omega_i\) are corrupted by bias "
-    r"and noise, then mapped to the world via the rotation matrix \(R_{wb}(t)\)."""
+    r"""Each IMU \(i\) sits at lever arm position \(r_i\) in the vehicle frame. Body-frame
+    specific force \(a_i\) and angular rate \(\omega_i\) are corrupted by bias and noise, then
+    mapped to the world via the rotation matrix \(R_{wb}(t)\). Gyroscope measurements are
+    location independent, while accelerometers sense both translational and apparent acceleration
+    from rotation."""
 )
 st.latex(r"R_{wb}(t+\Delta t) = R_{wb}(t)\,\exp\!\left([\omega(t)\Delta t]_\times\right)")
 st.latex(r"v(t+\Delta t) = v(t) + \big(R_{wb}(t)a_{trans}(t) + g\big)\Delta t")
 st.latex(r"p(t+\Delta t) = p(t) + v(t)\Delta t + \tfrac{1}{2}\big(R_{wb}(t)a_{trans}(t) + g\big)\Delta t^2")
 st.caption(
-    "The exponential map integrates angular velocity; translational acceleration comes from "
-    "fusing lever-arm-compensated IMU readings."
+    "The exponential map integrates angular velocity; translational acceleration is derived from"
+    " the virtual-IMU fusion below rather than per-IMU lever-arm corrections."
 )
 
-st.subheader("Lever-arm compensation")
+st.subheader("Virtual IMU via weighted averaging (lever-arm neutralized)")
 st.markdown(
-    r"""Each IMU experiences apparent acceleration from rotation; removing it exposes the
-    translational component that the paper fuses across the network."""
+    r"""Section IV-C shows that choosing weights \(w_j\) such that \(\sum_j w_j r_j = 0\) makes
+    the accelerometer fusion insensitive to individual lever arms. Setting the VIMU frame equal to
+    the vehicle frame yields a single virtual sensor whose apparent acceleration terms cancel: the
+    fused accelerometer behaves as if it were co-located at the origin, while gyroscopes are already
+    location independent."""
 )
-st.latex(
-    r"a_{trans,i}(t) = a_i(t) - \dot{\omega}(t) \times r_i - \omega(t) \times (\omega(t) \times r_i)"
-)
-st.latex(r"\hat{a}(t) = \sum_i w_i\,a_{trans,i}(t), \quad w_i \propto \Sigma_i^{-1}")
+st.latex(r"\bar{y}_a(t) = \sum_j w_j\,y^a_j(t), \quad \bar{y}_\omega(t) = \sum_j v_j\,y^\omega_j(t)")
+st.latex(r"\sum_j w_j r_j = 0 \;\Rightarrow\; \bar{y}_a(t) \text{ free of lever-arm terms}")
+st.latex(r"\hat{\omega}(t) = \bar{y}_\omega(t) - \hat{b}^\omega(t), \quad \hat{a}(t) = \bar{y}_a(t) - \hat{b}^a(t)")
 st.caption(
-    "Weights follow the inverse covariance of each IMU; spatial diversity makes the centrifugal term informative for attitude and bias estimation."
+    "Equation (15) in the paper: combined biases remain slowly varying, so the filter tracks only the"
+    " fused bias terms instead of per-IMU biases, reducing compute while improving noise rejection"
+    " (\(\sigma_{\text{fused}} = \sigma / n\) for \(n\) identical IMUs with equal weights)."
 )
 
 st.subheader("Bias, noise, and drift")

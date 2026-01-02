@@ -117,6 +117,43 @@ def _drift_entries(count: int, unique: bool) -> List[Dict[str, float]]:
     return [DEFAULT_DRIFT for _ in range(count)]
 
 
+def _gyro_weights(noise: List[float]) -> List[float]:
+    """Weights that minimize combined gyro variance with sum-to-one constraint."""
+    if len(noise) == 1:
+        return [1.0]
+    sigma_sq = np.square(np.array(noise))
+    inv_sigma_sq = 1.0 / sigma_sq
+    weights = inv_sigma_sq / np.sum(inv_sigma_sq)
+    return weights.tolist()
+
+
+def _accel_weights(positions: List[List[float]], noise: List[float]) -> List[float]:
+    """Closed-form accelerometer weights enforcing R w = 0 and 1^T w = 1 (Eq. 18–25)."""
+    n = len(positions)
+    if n == 1:
+        return [1.0]
+
+    pos = np.array(positions)  # (n, 3)
+    sigma_sq = np.square(np.array(noise))
+    sigma_sq = np.where(sigma_sq <= 0, 1e-12, sigma_sq)
+
+    Sigma_inv = np.diag(1.0 / sigma_sq)
+    R = pos.T  # (3, n)
+    R_bar = R @ Sigma_inv
+    R_bar_RT = R_bar @ R.T  # (3, 3)
+    r_bar = R_bar @ np.ones(n)
+
+    correction = R.T @ (np.linalg.pinv(R_bar_RT) @ r_bar)
+    w_hat = Sigma_inv @ (np.ones(n) - correction)
+
+    denom = np.sum(w_hat)
+    if np.isclose(denom, 0.0):
+        return [1.0 / n for _ in range(n)]
+
+    w_star = w_hat / denom
+    return w_star.tolist()
+
+
 def main():
     st.title("IMU Network Builder")
     st.sidebar.header("Layout Controls")
@@ -125,7 +162,12 @@ def main():
 
     if symmetric:
         radius = st.sidebar.slider(
-            "Radial placement (m)", min_value=0.03, max_value=5.0, value=1.0, step=0.01
+            "Radial placement (m)",
+            min_value=0.03,
+            max_value=5.0,
+            value=1.0,
+            step=0.01,
+            format="%0.2f",
         )
         positions = _symmetric_positions(num_imus, radius)
     else:
@@ -146,6 +188,11 @@ def main():
     homogeneous = st.sidebar.checkbox("Homogeneous sensors", value=True)
     drifts = _drift_entries(num_imus, unique=not homogeneous)
 
+    # use noise_density as sigma proxy for both gyro and accel weighting
+    noise_sigmas = [entry["noise_density"] for entry in drifts]
+    gyro_weights = _gyro_weights(noise_sigmas)
+    accel_weights = _accel_weights(positions, noise_sigmas)
+
     st.markdown(
         """
         Default coordinates mirror the placement examples in the paper: symmetric layouts
@@ -155,12 +202,33 @@ def main():
     )
     _plot_positions(positions)
 
+    st.subheader("Estimated VIMU weights")
+    st.markdown(
+        """
+        Weights are estimated from the paper's Section IV-D/IV-E: gyroscope weights minimize
+        combined variance with a sum-to-one constraint, while accelerometer weights additionally
+        satisfy \(\sum_j w_j r_j = 0\) to place the virtual IMU at the vehicle frame. Identical
+        sensors collapse to equal weights; heterogeneous noise tilts weights toward quieter units.
+        """
+    )
+    weight_rows = []
+    for idx in range(num_imus):
+        weight_rows.append(
+            {
+                "IMU": f"#{idx+1}",
+                "Accel weight": f"{accel_weights[idx]:0.4f}",
+                "Gyro weight": f"{gyro_weights[idx]:0.4f}",
+            }
+        )
+    st.table(weight_rows)
+
     config = {
         "symmetric": symmetric,
         "num_imus": num_imus,
         "positions": positions,
         "homogeneous": homogeneous,
         "drift_models": drifts,
+        "weights": {"accelerometer": accel_weights, "gyroscope": gyro_weights},
     }
 
     st.subheader("Export configuration")
