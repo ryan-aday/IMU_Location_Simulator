@@ -5,8 +5,8 @@ providing interactive placement, simulation, and integration helpers grounded in
 
 ## Features
 - **Math overview** with LaTeX equations for networked IMU fusion and motivation versus single-IMU baselines.
-- **IMU network builder** with symmetric/asymmetric layouts (1, 2, 4, 6, 8, 10, or 12 sensors), tunable ICM-45686-style drift models,
-  live 3D placement visualization, per-IMU weight display, and JSON export (weights included).
+- **IMU network builder** with symmetric/asymmetric layouts supporting 1–19 sensors, tunable ICM-45686-style drift models,
+  live 3D placement visualization, per-IMU weight display, and JSON export (weights included). Symmetric layouts allow radii down to 0.03 m.
 - **Path simulation** that loads your JSON, generates a smooth random-walk trajectory (FANET-style continuous turning) or links
   to Penn COSYVIO data, replays weighted strapdown integration with fused biases/noise, and reports positional/rotational RMSE/MAE
   along with downloadable results.

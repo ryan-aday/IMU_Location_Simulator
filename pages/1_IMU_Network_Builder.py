@@ -42,14 +42,23 @@ def _symmetric_positions(count: int, radius: float) -> List[List[float]]:
     if count in base:
         return base[count]
 
-    if count in {8, 10, 12}:
-        # Evenly distribute around a circle in the XY plane and add mirrored Z layers for coverage.
-        angles = np.linspace(0, 2 * np.pi, num=count // 2, endpoint=False)
-        upper = [[radius * np.cos(a), radius * np.sin(a), radius * 0.35] for a in angles]
-        lower = [[radius * np.cos(a), radius * np.sin(a), -radius * 0.35] for a in angles]
-        return upper + lower
+    # For arbitrary counts (3 through 19), spread IMUs evenly on a sphere using a Fibonacci lattice.
+    n = max(1, min(count, 19))
+    if n == 1:
+        return base[1]
 
-    return base[1]
+    indices = np.arange(n)
+    phi = np.pi * (3.0 - np.sqrt(5.0))
+    y = 1 - (indices / max(1, n - 1)) * 2  # from 1 to -1
+    radius_xy = np.sqrt(np.clip(1 - y * y, 0.0, 1.0))
+    theta = phi * indices
+
+    positions = []
+    for i in range(n):
+        x = np.cos(theta[i]) * radius_xy[i] * radius
+        z = np.sin(theta[i]) * radius_xy[i] * radius
+        positions.append([x, y[i] * radius, z])
+    return positions
 
 
 def _asymmetric_positions(count: int) -> List[List[float]]:
@@ -107,7 +116,23 @@ def _asymmetric_positions(count: int) -> List[List[float]]:
             [-0.24, -0.14, 0.26],
         ],
     }
-    return presets.get(count, presets[1])
+
+    if count in presets:
+        return presets[count]
+
+    # Generate deterministic, spread-out positions for counts 3–19 using a skewed ring pattern.
+    n = max(1, min(count, 19))
+    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    radial = 0.35
+    z_scale = 0.2
+    positions = []
+    for idx, ang in enumerate(angles):
+        jitter = 0.05 * ((idx % 3) - 1)
+        x = radial * np.cos(ang) + jitter
+        y = radial * np.sin(ang) - jitter
+        z = z_scale * np.sin(2 * ang) + 0.1 * ((idx % 2) - 0.5)
+        positions.append([x, y, z])
+    return positions
 
 
 def _plot_positions(positions: List[List[float]]):
@@ -232,7 +257,9 @@ def main():
     st.title("IMU Network Builder")
     st.sidebar.header("Layout Controls")
     symmetric = st.sidebar.checkbox("Symmetric layout", value=True)
-    num_imus = st.sidebar.selectbox("Number of IMUs", options=[1, 2, 4, 6, 8, 10, 12], index=3)
+    num_imus = int(
+        st.sidebar.number_input("Number of IMUs", min_value=1, max_value=19, value=6, step=1)
+    )
 
     if symmetric:
         radius = st.sidebar.slider(
