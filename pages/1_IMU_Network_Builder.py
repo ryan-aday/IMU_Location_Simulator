@@ -284,7 +284,7 @@ def main():
 
     st.subheader("Estimated VIMU weights")
     st.markdown(
-        """
+        r"""
         Weights are estimated from the paper's Section IV-D/IV-E: gyroscope weights minimize
         combined variance with a sum-to-one constraint, while accelerometer weights additionally
         satisfy \(\sum_j w_j r_j = 0\) to place the virtual IMU at the vehicle frame. Identical

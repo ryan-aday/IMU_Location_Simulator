@@ -34,9 +34,9 @@ st.latex(r"\bar{y}_a(t) = \sum_j w_j\,y^a_j(t), \quad \bar{y}_\omega(t) = \sum_j
 st.latex(r"\sum_j w_j r_j = 0 \;\Rightarrow\; \bar{y}_a(t) \text{ free of lever-arm terms}")
 st.latex(r"\hat{\omega}(t) = \bar{y}_\omega(t) - \hat{b}^\omega(t), \quad \hat{a}(t) = \bar{y}_a(t) - \hat{b}^a(t)")
 st.caption(
-    "Equation (15) in the paper: combined biases remain slowly varying, so the filter tracks only the"
-    " fused bias terms instead of per-IMU biases, reducing compute while improving noise rejection"
-    " (\(\sigma_{\text{fused}} = \sigma / n\) for \(n\) identical IMUs with equal weights)."
+    r"Equation (15) in the paper: combined biases remain slowly varying, so the filter tracks only the"
+    r" fused bias terms instead of per-IMU biases, reducing compute while improving noise rejection"
+    r" (\(\sigma_{\text{fused}} = \sigma / n\) for \(n\) identical IMUs with equal weights)."
 )
 
 st.subheader("Bias, noise, and drift")
