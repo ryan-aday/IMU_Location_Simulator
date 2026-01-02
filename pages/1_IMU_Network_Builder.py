@@ -124,7 +124,9 @@ def main():
     num_imus = st.sidebar.selectbox("Number of IMUs", options=[1, 2, 4, 6], index=3)
 
     if symmetric:
-        radius = st.sidebar.slider("Radial placement (m)", min_value=0.05, max_value=0.6, value=0.3, step=0.01)
+        radius = st.sidebar.slider(
+            "Radial placement (m)", min_value=0.03, max_value=5.0, value=1.0, step=0.01
+        )
         positions = _symmetric_positions(num_imus, radius)
     else:
         st.sidebar.markdown("Customize each IMU position (m)")
