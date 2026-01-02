@@ -10,9 +10,10 @@ CONFIG_DIR = Path("saved_configs")
 CONFIG_DIR.mkdir(exist_ok=True)
 
 DEFAULT_DRIFT = {
-    "gyro_drift_dps": 0.5,  # degrees per second zero-rate level (approx from BNO086 typical)
-    "accel_bias_mps2": 0.08,  # m/s^2 bias
-    "noise_density": 0.003,  # approximate rad/s / sqrt(Hz)
+    # SparkFun BNO086 (VR IMU) published accuracies
+    "gyro_drift_dps": 3.1,  # °/s gyro accuracy
+    "accel_bias_mps2": 0.35,  # m/s^2 linear acceleration accuracy
+    "noise_density": 0.3,  # m/s^2 accel accuracy (used as sigma proxy for weighting)
 }
 
 

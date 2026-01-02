@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,98 +20,116 @@ def _load_config(uploaded_file) -> Dict:
     return json.load(uploaded_file)
 
 
-def _simulate_path(duration_s: float, avg_speed: float, step: float = 0.01):
-    """Smooth 3D random walk using correlated turn rates (FANET-inspired smooth model).
+def _ou_process(n: int, dt: float, beta: float, sigma: float) -> np.ndarray:
+    rng = np.random.default_rng()
+    x = np.zeros((n, 3))
+    for i in range(1, n):
+        dW = rng.normal(scale=np.sqrt(dt), size=3)
+        x[i] = x[i - 1] + beta * (-x[i - 1]) * dt + sigma * dW
+    return x
 
-    The smooth-turn mobility idea (see "A 3D Smooth Random Walk Mobility Model for FANETs")
-    is approximated by shaping angular velocity with an Ornstein–Uhlenbeck process so that
-    heading changes are gradual instead of jittery. Speed is held near the chosen average
-    with small noise, and Z motion drifts slowly to avoid sudden jumps.
+
+def _quat_mult(q: np.ndarray, r: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = q
+    w2, x2, y2, z2 = r
+    return np.array(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ]
+    )
+
+
+def _quat_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
+    if angle < 1e-9:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    axis = axis / (np.linalg.norm(axis) + 1e-12)
+    half = 0.5 * angle
+    s = np.sin(half)
+    return np.array([np.cos(half), axis[0] * s, axis[1] * s, axis[2] * s])
+
+
+def _quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y**2 + z**2), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x**2 + z**2), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x**2 + y**2)],
+        ]
+    )
+
+
+def _simulate_path(duration_s: float, avg_speed: float, step: float = 0.01) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray], np.ndarray, np.ndarray]:
+    """Smooth 3D random walk with strapdown-ready outputs.
+
+    Generates correlated angular rates (OU process) and body specific force, integrates
+    quaternions for attitude, then integrates velocity/position so the strapdown replay
+    can synthesize IMU measurements along the same ground truth.
     """
 
     t = np.arange(0, duration_s, step)
     n = t.size
-
-    # Ornstein–Uhlenbeck parameters for smooth turning
-    beta = 0.6  # mean reversion rate
-    sigma_turn = 0.4  # turn rate volatility (rad/s)
     dt = step
 
-    rng = np.random.default_rng()
-    omega = np.zeros((n, 3))
+    # Smooth angular motion and specific force noise
+    omega_true = _ou_process(n, dt, beta=0.6, sigma=0.3)  # rad/s
+    specific_force_body = _ou_process(n, dt, beta=0.8, sigma=0.8)  # m/s^2 body-frame specific force
+
+    # Initialize attitude quaternion and integrate
+    q = np.zeros((n, 4))
+    q[0] = np.array([1.0, 0.0, 0.0, 0.0])
     for i in range(1, n):
-        dW = rng.normal(scale=np.sqrt(dt), size=3)
-        omega[i] = omega[i - 1] + beta * (-omega[i - 1]) * dt + sigma_turn * dW
+        dw = omega_true[i] * dt
+        angle = np.linalg.norm(dw)
+        dq = _quat_from_axis_angle(dw if angle > 0 else np.array([1.0, 0.0, 0.0]), angle)
+        q[i] = _quat_mult(q[i - 1], dq)
+        q[i] = q[i] / (np.linalg.norm(q[i]) + 1e-12)
 
-    # Integrate orientation as a heading vector
-    heading = np.zeros((n, 3))
-    heading[0] = np.array([1.0, 0.0, 0.05])
-    for i in range(1, n):
-        heading[i] = heading[i - 1] + np.cross(heading[i - 1], omega[i]) * dt
-        norm = np.linalg.norm(heading[i])
-        if norm > 0:
-            heading[i] /= norm
+    R_list = [_quat_to_rotmat(qi) for qi in q]
 
-    # Speed profile with mild noise, clipped to non-negative
-    speed = np.clip(avg_speed + rng.normal(scale=0.05 * avg_speed, size=n), a_min=0.0, a_max=None)
-
-    # Position integration from heading + speed
+    # Integrate translational motion
+    g = np.array([0.0, 0.0, -9.81])
+    vel = np.zeros((n, 3))
     pos = np.zeros((n, 3))
+
     for i in range(1, n):
-        vel = heading[i] * speed[i]
-        pos[i] = pos[i - 1] + vel * dt
+        force_world = R_list[i] @ specific_force_body[i] + g
+        # Encourage speed to stay near avg_speed via damping toward target magnitude
+        speed = np.linalg.norm(vel[i - 1])
+        if speed > 1e-6:
+            correction_dir = vel[i - 1] / speed
+        else:
+            correction_dir = R_list[i][:, 0]
+        speed_error = avg_speed - speed
+        accel_correction = 0.3 * speed_error * correction_dir
+        accel_world = force_world + accel_correction
+        vel[i] = vel[i - 1] + accel_world * dt
+        pos[i] = pos[i - 1] + vel[i] * dt
 
-    return t, pos, heading
-
-
-def _rotation_matrix_from_heading(heading: np.ndarray, fallback: np.ndarray) -> np.ndarray:
-    """Build a body-to-world rotation from a heading vector, keeping axes orthonormal."""
-
-    eps = 1e-8
-    h = heading
-    if np.linalg.norm(h) < eps:
-        h = fallback
-    h = h / (np.linalg.norm(h) + eps)
-
-    world_up = np.array([0.0, 0.0, 1.0])
-    right = np.cross(world_up, h)
-    if np.linalg.norm(right) < eps:
-        world_up = np.array([0.0, 1.0, 0.0])
-        right = np.cross(world_up, h)
-    right = right / (np.linalg.norm(right) + eps)
-
-    body_z = np.cross(h, right)
-    body_z = body_z / (np.linalg.norm(body_z) + eps)
-
-    R_bw = np.stack([h, right, body_z], axis=1)  # columns are body axes in world frame
-    return R_bw
+    return t, pos, R_list, omega_true, specific_force_body
 
 
-def _angular_velocity(R_prev: np.ndarray, R_curr: np.ndarray, dt: float) -> np.ndarray:
-    """Approximate body angular velocity from successive rotation matrices."""
-
-    delta = R_prev.T @ R_curr
-    trace = np.trace(delta)
-    angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
-    if angle < 1e-6:
-        return np.zeros(3)
-
-    skew = (delta - delta.T) / (2.0 * np.sin(angle) + 1e-9)
-    axis = np.array([skew[2, 1], skew[0, 2], skew[1, 0]])
-    return axis * angle / dt
-
-
-def _strapdown_path(t: np.ndarray, pos_true: np.ndarray, heading: np.ndarray, config: Dict) -> np.ndarray:
+def _strapdown_path(
+    t: np.ndarray,
+    pos_true: np.ndarray,
+    rotations_true: List[np.ndarray],
+    omega_true: np.ndarray,
+    specific_force_body: np.ndarray,
+    config: Dict,
+) -> Tuple[np.ndarray, List[np.ndarray]]:
     """Perform strapdown integration using fused IMU biases/weights (Eq. 15)."""
 
     if t.size < 2:
-        return pos_true.copy()
+        return pos_true.copy(), rotations_true
 
     drift_models: List[Dict[str, float]] = config.get("drift_models", []) if config else []
     n = len(drift_models)
 
     if n == 0:
-        return pos_true.copy()
+        return pos_true.copy(), rotations_true
 
     accel_weights = np.array(config.get("weights", {}).get("accelerometer", []), dtype=float)
     gyro_weights = np.array(config.get("weights", {}).get("gyroscope", []), dtype=float)
@@ -137,50 +155,37 @@ def _strapdown_path(t: np.ndarray, pos_true: np.ndarray, heading: np.ndarray, co
     dt = np.diff(t)
     g = np.array([0.0, 0.0, -9.81])
 
-    # Build reference rotations
-    R_list = []
-    fallback = np.array([1.0, 0.0, 0.0])
-    for h in heading:
-        R_list.append(_rotation_matrix_from_heading(h, fallback))
-        fallback = h if np.linalg.norm(h) > 1e-8 else fallback
-
     pos_est = np.zeros_like(pos_true)
     vel_est = np.zeros_like(pos_true)
-    R_est = R_list[0].copy()
+    q_est = np.array([1.0, 0.0, 0.0, 0.0])
+    R_est_list: List[np.ndarray] = [_quat_to_rotmat(q_est)]
 
     rng = np.random.default_rng()
 
-    # Compute true kinematics for measurement synthesis
-    vel_true = np.gradient(pos_true, t, axis=0)
-    accel_true = np.gradient(vel_true, t, axis=0)
-
     for i in range(1, t.size):
         dt_i = dt[i - 1]
-        R_true_prev = R_list[i - 1]
-        R_true_curr = R_list[i]
-        omega_true = _angular_velocity(R_true_prev, R_true_curr, dt_i)
 
-        # Measurements
-        gyro_meas = omega_true + np.deg2rad(fused_gyro_bias) + rng.normal(scale=np.deg2rad(fused_gyro_sigma), size=3)
-        accel_body_true = R_true_curr.T @ (accel_true[i] - g)
-        accel_meas = accel_body_true + fused_accel_bias + rng.normal(scale=fused_accel_sigma, size=3)
+        # Measurements synthesized from truth + fused bias/noise
+        gyro_meas = omega_true[i] + np.deg2rad(fused_gyro_bias) + rng.normal(scale=np.deg2rad(fused_gyro_sigma), size=3)
+        accel_meas = specific_force_body[i] + fused_accel_bias + rng.normal(scale=fused_accel_sigma, size=3)
 
-        # Bias-compensated estimates (Eq. 15 simplified)
+        # Bias-compensated estimates (Eq. 15)
         omega_est = gyro_meas - np.deg2rad(fused_gyro_bias)
         accel_body_est = accel_meas - fused_accel_bias
 
-        # Orientation update (first-order integration)
+        # Quaternion update using exponential map
         angle = np.linalg.norm(omega_est) * dt_i
-        if angle > 0:
-            axis = omega_est / (np.linalg.norm(omega_est) + 1e-9)
-            K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-            R_est = R_est @ (np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K))
+        dq = _quat_from_axis_angle(omega_est if angle > 0 else np.array([1.0, 0.0, 0.0]), angle)
+        q_est = _quat_mult(q_est, dq)
+        q_est = q_est / (np.linalg.norm(q_est) + 1e-12)
+        R_est = _quat_to_rotmat(q_est)
+        R_est_list.append(R_est)
 
         accel_world = R_est @ accel_body_est + g
         vel_est[i] = vel_est[i - 1] + accel_world * dt_i
         pos_est[i] = pos_est[i - 1] + vel_est[i] * dt_i
 
-    return pos_est
+    return pos_est, R_est_list
 
 
 def _plot_paths(t: np.ndarray, truth: np.ndarray, estimate: np.ndarray):
@@ -226,21 +231,21 @@ def main():
         )
 
     st.subheader("Generate trajectory")
-    t, ground_truth, heading = _simulate_path(duration, avg_speed=avg_speed)
-    estimate = _strapdown_path(t, ground_truth, heading, config)
+    t, ground_truth, rotations_true, omega_true, specific_force_body = _simulate_path(duration, avg_speed=avg_speed)
+    estimate, rotations_est = _strapdown_path(t, ground_truth, rotations_true, omega_true, specific_force_body, config)
     _plot_paths(t, ground_truth, estimate)
 
     position_error = np.linalg.norm(estimate - ground_truth, axis=1)
     pos_rmse = float(np.sqrt(np.mean(position_error**2)))
     pos_mae = float(np.mean(np.abs(position_error)))
 
-    truth_vel = np.gradient(ground_truth, t, axis=0)
-    est_vel = np.gradient(estimate, t, axis=0)
-    truth_dir = truth_vel / (np.linalg.norm(truth_vel, axis=1, keepdims=True) + 1e-8)
-    est_dir = est_vel / (np.linalg.norm(est_vel, axis=1, keepdims=True) + 1e-8)
-    cos_angles = np.sum(truth_dir * est_dir, axis=1)
-    cos_angles = np.clip(cos_angles, -1.0, 1.0)
-    ang_err = np.arccos(cos_angles)
+    ang_err = []
+    for r_true, r_est in zip(rotations_true, rotations_est):
+        delta = r_true.T @ r_est
+        trace = np.trace(delta)
+        angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+        ang_err.append(angle)
+    ang_err = np.array(ang_err)
     rot_rmse = float(np.sqrt(np.mean(ang_err**2)))
     rot_mae = float(np.mean(np.abs(ang_err)))
 
@@ -253,16 +258,12 @@ def main():
     st.subheader("Error summary (separate position vs. rotation)")
     st.table(summary)
 
-    st.info(
-        "Errors may still exceed the paper if the simplified strapdown (first-order integration, coarse angular"
-        " rates) drifts or if the heading proxy deviates from your intended body frame. Leverage your exported"
-        " weights in a higher-fidelity strapdown to reduce drift further."
-    )
-
     export = {
         "time": t.tolist(),
         "ground_truth": ground_truth.tolist(),
         "estimate": estimate.tolist(),
+        "omega_true": omega_true.tolist(),
+        "specific_force_body": specific_force_body.tolist(),
         "config": config,
         "metrics": {
             "pos_rmse": pos_rmse,
