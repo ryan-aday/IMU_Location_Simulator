@@ -20,21 +20,52 @@ def _load_config(uploaded_file) -> Dict:
     return json.load(uploaded_file)
 
 
-def _simulate_path(duration_s: float, radius: float, avg_speed: float, step: float = 0.01):
-    """Generate a gentle Lissajous-like path with configurable spatial range and speed."""
+def _simulate_path(duration_s: float, spatial_span: float, avg_speed: float, step: float = 0.01):
+    """Smooth 3D random walk using correlated turn rates (FANET-inspired smooth model).
+
+    The smooth-turn mobility idea (see "A 3D Smooth Random Walk Mobility Model for FANETs")
+    is approximated by shaping angular velocity with an Ornstein–Uhlenbeck process so that
+    heading changes are gradual instead of jittery. Speed is held near the chosen average
+    with small noise, and Z motion drifts slowly to avoid sudden jumps.
+    """
+
     t = np.arange(0, duration_s, step)
+    n = t.size
 
-    # Approximate angular rate to match desired average speed around the XY loop
-    safe_radius = max(radius, 0.1)
-    omega_xy = max(avg_speed / safe_radius, 0.05)
-    omega_z = 0.5 * omega_xy
-    z_amp = 0.25 * safe_radius
+    # Ornstein–Uhlenbeck parameters for smooth turning
+    beta = 0.6  # mean reversion rate
+    sigma_turn = 0.4  # turn rate volatility (rad/s)
+    dt = step
 
-    ground_truth = np.stack(
-        [safe_radius * np.cos(omega_xy * t), safe_radius * np.sin(omega_xy * t), z_amp * np.sin(omega_z * t)],
-        axis=1,
-    )
-    return t, ground_truth
+    rng = np.random.default_rng()
+    omega = np.zeros((n, 3))
+    for i in range(1, n):
+        dW = rng.normal(scale=np.sqrt(dt), size=3)
+        omega[i] = omega[i - 1] + beta * (-omega[i - 1]) * dt + sigma_turn * dW
+
+    # Integrate orientation as a heading vector
+    heading = np.zeros((n, 3))
+    heading[0] = np.array([1.0, 0.0, 0.05])
+    for i in range(1, n):
+        heading[i] = heading[i - 1] + np.cross(heading[i - 1], omega[i]) * dt
+        norm = np.linalg.norm(heading[i])
+        if norm > 0:
+            heading[i] /= norm
+
+    # Speed profile with mild noise, clipped to non-negative
+    speed = np.clip(avg_speed + rng.normal(scale=0.05 * avg_speed, size=n), a_min=0.0, a_max=None)
+
+    # Position integration with spatial clamping to the chosen span
+    pos = np.zeros((n, 3))
+    for i in range(1, n):
+        vel = heading[i] * speed[i]
+        pos[i] = pos[i - 1] + vel * dt
+        # softly push back toward center if we exceed the span
+        radius = np.linalg.norm(pos[i])
+        if radius > spatial_span:
+            pos[i] -= 0.2 * (radius - spatial_span) * pos[i] / (radius + 1e-6)
+
+    return t, pos
 
 
 def _apply_imu_bias(path: np.ndarray, config: Dict, step: float = 0.01):
@@ -107,9 +138,13 @@ def main():
     config = _load_config(uploaded)
 
     dataset_choice = st.sidebar.radio("Trajectory source", ["Random synthetic", "Penn COSYVIO (describe)"])
-    duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=100000.0, value=60.0, step=1.0)
-    radius = st.sidebar.slider("Path range / radius (m)", min_value=0.5, max_value=20.0, value=3.0, step=0.1)
-    avg_speed = st.sidebar.slider("Average speed (m/s)", min_value=0.1, max_value=12.0, value=2.0, step=0.1)
+    duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=97200.0, value=60.0, step=1.0)
+    avg_speed = st.sidebar.slider("Average speed (m/s)", min_value=0.1, max_value=150.0, value=2.0, step=0.1)
+
+    max_span = max(0.5, min(10000.0, 0.25 * avg_speed * duration))
+    spatial_span = st.sidebar.slider(
+        "Path spatial span (m)", min_value=0.5, max_value=float(max_span), value=min(3.0, float(max_span)), step=0.1
+    )
 
     if dataset_choice == "Penn COSYVIO (describe)":
         meta = _load_penn_metadata()
@@ -119,20 +154,31 @@ def main():
         )
 
     st.subheader("Generate trajectory")
-    t, ground_truth = _simulate_path(duration, radius=radius, avg_speed=avg_speed)
+    t, ground_truth = _simulate_path(duration, spatial_span=spatial_span, avg_speed=avg_speed)
     estimate = _apply_imu_bias(ground_truth, config)
     _plot_paths(t, ground_truth, estimate)
 
     position_error = np.linalg.norm(estimate - ground_truth, axis=1)
-    rmse = float(np.sqrt(np.mean(position_error**2)))
-    mae = float(np.mean(np.abs(position_error)))
+    pos_rmse = float(np.sqrt(np.mean(position_error**2)))
+    pos_mae = float(np.mean(np.abs(position_error)))
+
+    truth_vel = np.gradient(ground_truth, t, axis=0)
+    est_vel = np.gradient(estimate, t, axis=0)
+    truth_dir = truth_vel / (np.linalg.norm(truth_vel, axis=1, keepdims=True) + 1e-8)
+    est_dir = est_vel / (np.linalg.norm(est_vel, axis=1, keepdims=True) + 1e-8)
+    cos_angles = np.sum(truth_dir * est_dir, axis=1)
+    cos_angles = np.clip(cos_angles, -1.0, 1.0)
+    ang_err = np.arccos(cos_angles)
+    rot_rmse = float(np.sqrt(np.mean(ang_err**2)))
+    rot_mae = float(np.mean(np.abs(ang_err)))
+
     summary = pd.DataFrame(
         {
-            "metric": ["RMSE [m]", "MAE [m]", "Final drift [m]"],
-            "value": [rmse, mae, float(position_error[-1])],
+            "metric": ["Positional RMSE [m]", "Positional MAE [m]", "Rotational RMSE [rad]", "Rotational MAE [rad]"],
+            "value": [pos_rmse, pos_mae, rot_rmse, rot_mae],
         }
     )
-    st.subheader("Error summary")
+    st.subheader("Error summary (separate position vs. rotation)")
     st.table(summary)
 
     st.info(
@@ -148,7 +194,12 @@ def main():
         "ground_truth": ground_truth.tolist(),
         "estimate": estimate.tolist(),
         "config": config,
-        "metrics": {"rmse": rmse, "mae": mae, "final_drift": float(position_error[-1])},
+        "metrics": {
+            "pos_rmse": pos_rmse,
+            "pos_mae": pos_mae,
+            "rot_rmse": rot_rmse,
+            "rot_mae": rot_mae,
+        },
     }
 
     st.download_button(
@@ -159,8 +210,8 @@ def main():
     )
 
     st.caption(
-        "Synthetic path uses a gentle Lissajous curve; error accumulation is influenced by your drift settings,"
-        " the simplified random-walk bias model here, and the lack of attitude/lever-arm compensation used in the paper."
+        "Synthetic path uses a smooth random walk inspired by the FANET mobility model; drift follows your weights and"
+        " bias settings but still omits full strapdown/lever-arm dynamics from the paper."
     )
 
 
