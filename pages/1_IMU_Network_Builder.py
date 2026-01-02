@@ -10,10 +10,12 @@ CONFIG_DIR = Path("saved_configs")
 CONFIG_DIR.mkdir(exist_ok=True)
 
 DEFAULT_DRIFT = {
-    # SparkFun BNO086 (VR IMU) published accuracies
-    "gyro_drift_dps": 3.1,  # °/s gyro accuracy
-    "accel_bias_mps2": 0.35,  # m/s^2 linear acceleration accuracy
-    "noise_density": 0.3,  # m/s^2 accel accuracy (used as sigma proxy for weighting)
+    # TDK InvenSense ICM-45686 published noise/accuracy references
+    # Gyro noise: 3.8 mdps/√Hz → 0.0038 °/s/√Hz (used as noise proxy)
+    # Accel noise: 70 µg/√Hz → ~6.9e-4 m/s²/√Hz
+    "gyro_drift_dps": 0.02,  # °/s proxy bias/accuracy
+    "accel_bias_mps2": 0.002,  # m/s^2 proxy bias/accuracy
+    "noise_density": 0.00069,  # m/s^2 sigma proxy for weighting
 }
 
 
@@ -162,14 +164,25 @@ def _drift_entries(count: int, unique: bool) -> List[Dict[str, float]]:
         for i in range(count):
             col1, col2, col3 = st.columns(3)
             with col1:
-                gyro = st.number_input(f"IMU #{i+1} gyro drift (°/s)", value=DEFAULT_DRIFT["gyro_drift_dps"], key=f"gyro_{i}")
+                gyro = st.number_input(
+                    f"IMU #{i+1} gyro drift (°/s)",
+                    value=DEFAULT_DRIFT["gyro_drift_dps"],
+                    key=f"gyro_{i}",
+                    format="%0.7f",
+                )
             with col2:
                 accel = st.number_input(
-                    f"IMU #{i+1} accel bias (m/s²)", value=DEFAULT_DRIFT["accel_bias_mps2"], key=f"accel_{i}"
+                    f"IMU #{i+1} accel bias (m/s²)",
+                    value=DEFAULT_DRIFT["accel_bias_mps2"],
+                    key=f"accel_{i}",
+                    format="%0.7f",
                 )
             with col3:
                 noise = st.number_input(
-                    f"IMU #{i+1} noise density", value=DEFAULT_DRIFT["noise_density"], key=f"noise_{i}"
+                    f"IMU #{i+1} noise density",
+                    value=DEFAULT_DRIFT["noise_density"],
+                    key=f"noise_{i}",
+                    format="%0.7f",
                 )
             drift_entries.append(
                 {"gyro_drift_dps": gyro, "accel_bias_mps2": accel, "noise_density": noise}
@@ -227,8 +240,8 @@ def main():
             min_value=0.03,
             max_value=5.0,
             value=1.0,
-            step=0.01,
-            format="%0.2f",
+            step=0.0001,
+            format="%0.7f",
         )
         positions = _symmetric_positions(num_imus, radius)
     else:
@@ -238,11 +251,17 @@ def main():
         for i in range(num_imus):
             colx, coly, colz = st.sidebar.columns(3)
             with colx:
-                x = st.number_input(f"IMU #{i+1} x", value=float(default_positions[i][0]), key=f"x_{i}")
+                x = st.number_input(
+                    f"IMU #{i+1} x", value=float(default_positions[i][0]), key=f"x_{i}", format="%0.7f"
+                )
             with coly:
-                y = st.number_input(f"IMU #{i+1} y", value=float(default_positions[i][1]), key=f"y_{i}")
+                y = st.number_input(
+                    f"IMU #{i+1} y", value=float(default_positions[i][1]), key=f"y_{i}", format="%0.7f"
+                )
             with colz:
-                z = st.number_input(f"IMU #{i+1} z", value=float(default_positions[i][2]), key=f"z_{i}")
+                z = st.number_input(
+                    f"IMU #{i+1} z", value=float(default_positions[i][2]), key=f"z_{i}", format="%0.7f"
+                )
             positions.append([x, y, z])
 
     st.sidebar.header("Sensor Model")
@@ -300,7 +319,7 @@ def main():
         st.success(f"Saved configuration to {target}")
 
     st.caption(
-        "BNO086 defaults come from SparkFun's breakout documentation; feel free to override with your own calibration values."
+        "ICM-45686 defaults derive from TDK InvenSense datasheets and community comparisons; override with your own calibration values."
     )
 
 

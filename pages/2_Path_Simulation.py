@@ -108,6 +108,11 @@ def _simulate_path(duration_s: float, avg_speed: float, step: float = 0.01) -> T
         accel_world = force_world + accel_correction
         vel[i] = vel[i - 1] + accel_world * dt
         pos[i] = pos[i - 1] + vel[i] * dt
+        # Enforce Reaper-like altitude envelope [0 m, 15,000 m]
+        clipped_z = np.clip(pos[i, 2], 0.0, 15000.0)
+        if not np.isclose(clipped_z, pos[i, 2]):
+            pos[i, 2] = clipped_z
+            vel[i, 2] = 0.0
 
     return t, pos, R_list, omega_true, specific_force_body
 
@@ -184,6 +189,9 @@ def _strapdown_path(
         accel_world = R_est @ accel_body_est + g
         vel_est[i] = vel_est[i - 1] + accel_world * dt_i
         pos_est[i] = pos_est[i - 1] + vel_est[i] * dt_i
+        pos_est[i, 2] = np.clip(pos_est[i, 2], 0.0, 15000.0)
+        if pos_est[i, 2] in {0.0, 15000.0}:
+            vel_est[i, 2] = 0.0
 
     return pos_est, R_est_list
 
@@ -220,8 +228,12 @@ def main():
     config = _load_config(uploaded)
 
     dataset_choice = st.sidebar.radio("Trajectory source", ["Random synthetic", "Penn COSYVIO (describe)"])
-    duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=97200.0, value=60.0, step=1.0)
-    avg_speed = st.sidebar.slider("Average speed (m/s)", min_value=0.1, max_value=150.0, value=2.0, step=0.1)
+    duration = st.sidebar.slider(
+        "Synthetic path duration (s)", min_value=5.0, max_value=97200.0, value=60.0, step=0.1, format="%0.7f"
+    )
+    avg_speed = st.sidebar.slider(
+        "Average speed (m/s)", min_value=0.1, max_value=150.0, value=2.0, step=0.01, format="%0.7f"
+    )
 
     if dataset_choice == "Penn COSYVIO (describe)":
         meta = _load_penn_metadata()
