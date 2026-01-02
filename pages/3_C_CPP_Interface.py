@@ -1,4 +1,10 @@
+import json
+from pathlib import Path
+
 import streamlit as st
+
+CONFIG_DIR = Path("saved_configs")
+CONFIG_DIR.mkdir(exist_ok=True)
 
 C_SNIPPET = r'''
 #include <stdio.h>
@@ -114,7 +120,46 @@ def main():
         Drop these snippets into your embedded or robotics stack to consume the exported JSON. The
         C version uses cJSON for tiny-footprint microcontrollers, while the C++ version targets
         desktop or ROS-style builds with [nlohmann/json](https://github.com/nlohmann/json).
+        Use the controls below to pick or tweak a JSON before downloading it for deployment.
         """
+    )
+
+    st.subheader("Select a configuration to download")
+    saved_files = sorted(CONFIG_DIR.glob("*.json"))
+    default_name = saved_files[0].name if saved_files else "imu_network.json"
+    chosen = st.selectbox("Saved config", options=[p.name for p in saved_files] or [default_name])
+
+    if saved_files:
+        config_path = CONFIG_DIR / chosen
+        config = json.loads(config_path.read_text())
+    else:
+        st.warning("No saved JSON found in saved_configs/. Use Page 1 to export a network first.")
+        config = {
+            "num_imus": 0,
+            "positions": [],
+            "drift_models": [],
+            "weights": {"accelerometer": [], "gyroscope": []},
+        }
+
+    st.subheader("Annotate simulation parameters")
+    path_length_s = st.number_input("Path duration (s)", value=20.0, min_value=1.0, step=1.0)
+    path_radius_m = st.number_input("Path range / radius (m)", value=3.0, min_value=0.1, step=0.1)
+    vehicle_speed = st.number_input("Average speed (m/s)", value=2.0, min_value=0.1, step=0.1)
+
+    enriched = {
+        "network": config,
+        "simulation": {
+            "duration_s": path_length_s,
+            "radius_m": path_radius_m,
+            "avg_speed_mps": vehicle_speed,
+        },
+    }
+
+    st.download_button(
+        "Download JSON for deployment",
+        data=json.dumps(enriched, indent=2),
+        file_name=chosen,
+        mime="application/json",
     )
 
     st.subheader("C (cJSON)")

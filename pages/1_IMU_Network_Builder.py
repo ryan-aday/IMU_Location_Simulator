@@ -35,7 +35,18 @@ def _symmetric_positions(count: int, radius: float) -> List[List[float]]:
             [0.0, 0.0, -radius],
         ],
     }
-    return base.get(count, base[1])
+
+    if count in base:
+        return base[count]
+
+    if count in {8, 10, 12}:
+        # Evenly distribute around a circle in the XY plane and add mirrored Z layers for coverage.
+        angles = np.linspace(0, 2 * np.pi, num=count // 2, endpoint=False)
+        upper = [[radius * np.cos(a), radius * np.sin(a), radius * 0.35] for a in angles]
+        lower = [[radius * np.cos(a), radius * np.sin(a), -radius * 0.35] for a in angles]
+        return upper + lower
+
+    return base[1]
 
 
 def _asymmetric_positions(count: int) -> List[List[float]]:
@@ -56,6 +67,42 @@ def _asymmetric_positions(count: int) -> List[List[float]]:
             [0.32, 0.05, 0.08],
             [-0.28, -0.05, -0.16],
         ],
+        8: [
+            [0.25, -0.1, 0.15],
+            [-0.15, 0.18, -0.05],
+            [-0.2, -0.22, 0.12],
+            [0.1, 0.2, -0.18],
+            [0.32, 0.05, 0.08],
+            [-0.28, -0.05, -0.16],
+            [0.05, -0.32, 0.1],
+            [-0.12, 0.26, -0.22],
+        ],
+        10: [
+            [0.25, -0.1, 0.15],
+            [-0.15, 0.18, -0.05],
+            [-0.2, -0.22, 0.12],
+            [0.1, 0.2, -0.18],
+            [0.32, 0.05, 0.08],
+            [-0.28, -0.05, -0.16],
+            [0.05, -0.32, 0.1],
+            [-0.12, 0.26, -0.22],
+            [0.22, -0.18, -0.14],
+            [-0.3, 0.12, 0.18],
+        ],
+        12: [
+            [0.25, -0.1, 0.15],
+            [-0.15, 0.18, -0.05],
+            [-0.2, -0.22, 0.12],
+            [0.1, 0.2, -0.18],
+            [0.32, 0.05, 0.08],
+            [-0.28, -0.05, -0.16],
+            [0.05, -0.32, 0.1],
+            [-0.12, 0.26, -0.22],
+            [0.22, -0.18, -0.14],
+            [-0.3, 0.12, 0.18],
+            [0.16, 0.28, 0.04],
+            [-0.24, -0.14, 0.26],
+        ],
     }
     return presets.get(count, presets[1])
 
@@ -63,7 +110,20 @@ def _asymmetric_positions(count: int) -> List[List[float]]:
 def _plot_positions(positions: List[List[float]]):
     positions = np.array(positions)
     fig = go.Figure()
-    colors = ["red", "blue", "green", "purple", "orange", "teal"]
+    colors = [
+        "red",
+        "blue",
+        "green",
+        "purple",
+        "orange",
+        "teal",
+        "magenta",
+        "brown",
+        "gold",
+        "navy",
+        "darkgreen",
+        "gray",
+    ]
     for i, pos in enumerate(positions):
         fig.add_trace(
             go.Scatter3d(
@@ -114,7 +174,7 @@ def _drift_entries(count: int, unique: bool) -> List[Dict[str, float]]:
                 {"gyro_drift_dps": gyro, "accel_bias_mps2": accel, "noise_density": noise}
             )
         return drift_entries
-    return [DEFAULT_DRIFT for _ in range(count)]
+    return [DEFAULT_DRIFT.copy() for _ in range(count)]
 
 
 def _gyro_weights(noise: List[float]) -> List[float]:
@@ -158,7 +218,7 @@ def main():
     st.title("IMU Network Builder")
     st.sidebar.header("Layout Controls")
     symmetric = st.sidebar.checkbox("Symmetric layout", value=True)
-    num_imus = st.sidebar.selectbox("Number of IMUs", options=[1, 2, 4, 6], index=3)
+    num_imus = st.sidebar.selectbox("Number of IMUs", options=[1, 2, 4, 6, 8, 10, 12], index=3)
 
     if symmetric:
         radius = st.sidebar.slider(

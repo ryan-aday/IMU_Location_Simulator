@@ -42,8 +42,9 @@ def _apply_imu_bias(path: np.ndarray, config: Dict, step: float = 0.01):
 
     The saved JSON carries per-IMU accelerometer/gyroscope weights and noise models. We
     collapse the accelerometer terms into a fused bias and fused noise using the same
-    weighting that placed the VIMU frame (Eq. 18–25). This keeps the simulator aligned
-    with the configuration authoring page instead of averaging biases naively.
+    weighting that placed the VIMU frame (Eq. 18–25). Noise is injected as a small
+    acceleration error and integrated to velocity/position to reduce over-inflated drift
+    while still reflecting how additional IMUs (and optimal weights) shrink \(\sigma^2\).
     """
 
     if not config:
@@ -67,11 +68,11 @@ def _apply_imu_bias(path: np.ndarray, config: Dict, step: float = 0.01):
     fused_bias = float(np.dot(accel_weights, biases))
     fused_sigma = float(np.sqrt(np.sum(np.square(accel_weights * noise_sigmas))))
 
-    # Weighted noise and bias accumulation applied to position proxy.
-    noise = np.random.normal(scale=fused_sigma, size=path.shape)
-    noisy = path + np.cumsum(noise * step, axis=0)
-    noisy += fused_bias * step * np.arange(path.shape[0])[:, None]
-    return noisy
+    # Treat fused bias/noise as acceleration disturbance and integrate to velocity/position.
+    accel_error = fused_bias + np.random.normal(scale=fused_sigma, size=path.shape)
+    vel_error = np.cumsum(accel_error * step, axis=0)
+    pos_error = np.cumsum(vel_error * step, axis=0)
+    return path + pos_error
 
 
 def _plot_paths(t: np.ndarray, truth: np.ndarray, estimate: np.ndarray):
@@ -106,7 +107,7 @@ def main():
     config = _load_config(uploaded)
 
     dataset_choice = st.sidebar.radio("Trajectory source", ["Random synthetic", "Penn COSYVIO (describe)"])
-    duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=60.0, value=20.0, step=1.0)
+    duration = st.sidebar.slider("Synthetic path duration (s)", min_value=5.0, max_value=100000.0, value=60.0, step=1.0)
     radius = st.sidebar.slider("Path range / radius (m)", min_value=0.5, max_value=20.0, value=3.0, step=0.1)
     avg_speed = st.sidebar.slider("Average speed (m/s)", min_value=0.1, max_value=12.0, value=2.0, step=0.1)
 
